@@ -1,115 +1,118 @@
 import os
-from math import cos, sin, pi, floor
+import time
+from math import cos, sin, pi, floor, sqrt
 import pygame
 from adafruit_rplidar import RPLidar
 
-# Screen width & height
-W = 640
-H = 480
-
-SCAN_BYTE = b'\x20'
-SCAN_TYPE = 129
-
-# Set up pygame and the display
-#os.putenv('SDL_FBDEV', '/dev/fb1')
+# --- Display Setup ---
+W, H = 640, 480
 pygame.display.init()
-lcd = pygame.display.set_mode((W,H))
+lcd = pygame.display.set_mode((W, H))
 pygame.mouse.set_visible(False)
-lcd.fill((200,0,0))
+lcd.fill((0, 0, 0))
 pygame.display.update()
 
-# Setup the RPLidar
+# --- LIDAR Setup ---
 PORT_NAME = '/dev/ttyUSB0'
 lidar = RPLidar(None, PORT_NAME)
 
-# used to scale data to fit on the screen
-max_distance = 0
+# --- Globals ---
+scan_data = [0] * 360
+persistent_map = []  # (x, y, quality, last_seen, hit_count)
+previous_frame = []  # List of (x, y, quality) from previous scan
+moving_points = []   # List of (x, y) for moving objects
 
-#pylint: disable=redefined-outer-name,global-statement
+MAX_DISTANCE = 5000  # mm
+MATCH_RADIUS = 30    # mm
+MAX_AGE = 10         # seconds to keep stable points
+MIN_HITS = 3         # min sightings to consider stable
+FRAME_TIMEOUT = 0.5  # seconds before a stable point is considered "gone"
+
+# --- Helper Functions ---
+def distance(p1, p2):
+    return sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+def update_persistent_map(current_points):
+    global persistent_map, moving_points, previous_frame
+    now = time.time()
+    moving_points = []
+
+    for new_x, new_y, quality in current_points:
+        matched = False
+        for i, (x, y, q, last_seen, hits) in enumerate(persistent_map):
+            if distance((new_x, new_y), (x, y)) < MATCH_RADIUS:
+                # Update existing stable point
+                persistent_map[i] = (
+                    (x + new_x) / 2, (y + new_y) / 2, (q + quality) / 2,
+                    now, hits + 1
+                )
+                matched = True
+                break
+        if not matched:
+            # New or moving point
+            moving_points.append((new_x, new_y))
+            persistent_map.append((new_x, new_y, quality, now, 1))
+
+    # Detect previously stable points that have disappeared
+    for x, y, q, t, hits in persistent_map:
+        if now - t < FRAME_TIMEOUT and hits >= MIN_HITS:
+            still_visible = any(distance((x, y), (px, py)) < MATCH_RADIUS for (px, py, _) in current_points)
+            if not still_visible:
+                moving_points.append((x, y))
+
+    # Remove old or unstable points
+    persistent_map = [
+        (x, y, q, t, hits)
+        for (x, y, q, t, hits) in persistent_map
+        if (now - t < MAX_AGE and hits >= MIN_HITS)
+    ]
+
+    previous_frame = current_points
+
 def process_data(data):
-    global max_distance
-    lcd.fill((0,0,0))
-    point = ( int(W / 2) , int(H / 2) )
-    
-    pygame.draw.circle(lcd,pygame.Color(255, 255, 255),point,10 )
-    pygame.draw.circle(lcd,pygame.Color(100, 100, 100),point,100 , 1 )
-    pygame.draw.line( lcd,pygame.Color(100, 100, 100) , ( 0, int(H/2)),( W , int(H/2) ) )
-    pygame.draw.line( lcd,pygame.Color(100, 100, 100) , ( int(W/2),0),( int(W/2) , H ) )
+    lcd.fill((0, 0, 0))
+    center = (W // 2, H // 2)
+    pygame.draw.circle(lcd, pygame.Color(255, 255, 255), center, 5)
+    pygame.draw.circle(lcd, pygame.Color(50, 50, 50), center, 100, 1)
+    pygame.draw.line(lcd, pygame.Color(50, 50, 50), (0, H // 2), (W, H // 2))
+    pygame.draw.line(lcd, pygame.Color(50, 50, 50), (W // 2, 0), (W // 2, H))
+
+    current_points = []
 
     for angle in range(360):
-        distance = data[angle]
-        if distance > 0:                  # ignore initially ungathered data points
-            max_distance = max([min([5000, distance]), max_distance])
+        dist = data[angle]
+        if 0 < dist < MAX_DISTANCE:
             radians = angle * pi / 180.0
-            x = distance * cos(radians)
-            y = distance * sin(radians)
-            point = ( int(W / 2) + int(x / max_distance * (W/2)), int(H/2) + int(y / max_distance * (H/2) ))
-            pygame.draw.circle(lcd,pygame.Color(255, 0, 0),point,2 )
+            x = dist * cos(radians)
+            y = dist * sin(radians)
+            current_points.append((x, y, 15))  # fake quality
+
+    update_persistent_map(current_points)
+
+    # Draw stable map points in green
+    for x, y, q, t, hits in persistent_map:
+        draw_x = int(W / 2 + x / MAX_DISTANCE * (W / 2))
+        draw_y = int(H / 2 + y / MAX_DISTANCE * (H / 2))
+        green_intensity = min(255, hits * 10)
+        pygame.draw.circle(lcd, (0, green_intensity, 0), (draw_x, draw_y), 2)
+
+    # Draw moving points in red
+    for mx, my in moving_points:
+        draw_x = int(W / 2 + mx / MAX_DISTANCE * (W / 2))
+        draw_y = int(H / 2 + my / MAX_DISTANCE * (H / 2))
+        pygame.draw.circle(lcd, (255, 0, 0), (draw_x, draw_y), 3)
+
     pygame.display.update()
 
-
-scan_data = [0]*360
-
-def _process_scan(raw):
-    '''Processes input raw data and returns measurment data'''
-    new_scan = bool(raw[0] & 0b1)
-    inversed_new_scan = bool((raw[0] >> 1) & 0b1)
-    quality = raw[0] >> 2
-    if new_scan == inversed_new_scan:
-        raise RPLidarException('New scan flags mismatch')
-    check_bit = raw[1] & 0b1
-    if check_bit != 1:
-        raise RPLidarException('Check bit not equal to 1')
-    angle = ((raw[1] >> 1) + (raw[2] << 7)) / 64.
-    distance = (raw[3] + (raw[4] << 8)) / 4.
-    return new_scan, quality, angle, distance
-
-def lidar_measurments(self, max_buf_meas=500):
-       
-        lidar.set_pwm(800)
-        status, error_code = self.health
-        
-        cmd = SCAN_BYTE
-        self._send_cmd(cmd)
-        dsize, is_single, dtype = self._read_descriptor()
-        if dsize != 5:
-            raise RPLidarException('Wrong info reply length')
-        if is_single:
-            raise RPLidarException('Not a multiple response mode')
-        if dtype != SCAN_TYPE:
-            raise RPLidarException('Wrong response data type')
-        while True:
-            raw = self._read_response(dsize)
-            self.log_bytes('debug', 'Received scan response: ', raw)
-            if max_buf_meas:
-                data_in_buf = self._serial_port.in_waiting
-                if data_in_buf > max_buf_meas*dsize:
-                    self.log('warning',
-                             'Too many measurments in the input buffer: %d/%d. '
-                             'Clearing buffer...' %
-                             (data_in_buf//dsize, max_buf_meas))
-                    self._serial_port.read(data_in_buf//dsize*dsize)
-            yield _process_scan(raw)
-
-def lidar_scans(self, max_buf_meas=500, min_len=5):
-        
-        scan = []
-        iterator = lidar_measurments(lidar,max_buf_meas)
-        for new_scan, quality, angle, distance in iterator:
-            if new_scan:
-                if len(scan) > min_len:
-                    yield scan
-                scan = []
-            if quality > 0 and distance > 0:
-                scan.append((quality, angle, distance))
-
-try:    
-     for scan in lidar_scans(lidar):
+# --- Main Loop ---
+try:
+    for scan in lidar.iter_scans():
         for (_, angle, distance) in scan:
             scan_data[min([359, floor(angle)])] = distance
         process_data(scan_data)
 
 except KeyboardInterrupt:
-    print('Stoping.')
+    print("Stopping.")
+
 lidar.stop()
 lidar.disconnect()
